@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "539775503244",
+    "project_id": "loo-locator-b7cc2",
+    "storage_bucket": "loo-locator-b7cc2.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:539775503244:android:243b015057c5a3cb6a64a9",
+        "android_client_info": {
+          "package_name": "com.example.loo_locator"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyChzEG02wO-DOqjLwbmFfARw9ApikuW-t8"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
