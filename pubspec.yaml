@@ -46,6 +46,7 @@ dependencies:
   exif_reader: ^4.1.0
   flutter_map_location_marker: ^10.2.0
   riverpod: ^3.2.1
+  image: ^4.8.0
 
 dev_dependencies:
   flutter_test:

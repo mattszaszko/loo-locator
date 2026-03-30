@@ -1,4 +1,3 @@
-import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:cloud_firestore/cloud_firestore.dart';
@@ -11,6 +10,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:flutter_map_location_marker/flutter_map_location_marker.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:image/image.dart' as img;
 import 'package:image_picker/image_picker.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -224,6 +224,8 @@ class _MainShellState extends State<MainShell> {
   int _selectedIndex = 1;
   Position? _currentPosition;
   bool _uploading = false;
+  String? _busyTitle;
+  String? _busySubtitle;
   final ImagePicker _picker = ImagePicker();
   final MapController _mapController = MapController();
   final CollectionReference<Map<String, dynamic>> _toiletCollection =
@@ -343,27 +345,44 @@ class _MainShellState extends State<MainShell> {
     if (_uploading) {
       return;
     }
-    setState(() => _uploading = true);
+    setState(() {
+      _uploading = true;
+      _busyTitle = 'Preparing…';
+      _busySubtitle = 'Reading photo metadata.';
+    });
     try {
       final XFile? picked = await _picker.pickImage(
         source: source,
-        imageQuality: 85,
+        // IMPORTANT: Compression/re-encoding often strips EXIF (including GPS),
+        // especially on iOS and on the web. Keep original bytes when possible.
+        imageQuality: null,
+        requestFullMetadata: true,
       );
       if (picked == null) {
         return;
       }
       final bytes = await picked.readAsBytes();
       final _ExtractedMetadata metadata = await _extractMetadata(bytes);
-      final Position? fallbackPosition = metadata.latLng == null
-          ? await _getCurrentPositionWithPermissions()
-          : null;
-      final LatLng? finalLatLng =
-          metadata.latLng ??
-          (fallbackPosition == null
-              ? null
-              : LatLng(fallbackPosition.latitude, fallbackPosition.longitude));
-      if (finalLatLng == null) {
-        _showMessage('Could not determine location. Enable GPS and try again.');
+
+      final Position? currentPos = await _getCurrentPositionWithPermissions();
+      final LatLng? deviceLatLng = currentPos == null
+          ? null
+          : LatLng(currentPos.latitude, currentPos.longitude);
+
+      final _PostLooConfirmation? confirmed = await _confirmPostLoo(
+        imageBytes: bytes,
+        exifLatLng: metadata.latLng,
+        deviceLatLng: deviceLatLng,
+        exifTimestamp: metadata.timestamp,
+      );
+      if (!mounted || confirmed == null) {
+        return;
+      }
+
+      if (confirmed.latLng == null) {
+        _showMessage(
+          'Could not determine location. Enable GPS or use a photo with GPS.',
+        );
         return;
       }
       final user = FirebaseAuth.instance.currentUser;
@@ -372,32 +391,252 @@ class _MainShellState extends State<MainShell> {
         return;
       }
 
+      setState(() {
+        _busyTitle = 'Posting loo…';
+        _busySubtitle = 'Compressing and uploading photo.';
+      });
+      final Uint8List uploadBytes = _compressForUpload(bytes);
+
       final now = DateTime.now().millisecondsSinceEpoch;
-      final storageRef = FirebaseStorage.instance.ref().child(
-        'toilets/$now.jpg',
+      final storagePath = 'toilets/$now.jpg';
+      final storageRef = FirebaseStorage.instance.ref().child(storagePath);
+      await storageRef.putData(
+        uploadBytes,
+        SettableMetadata(contentType: 'image/jpeg'),
       );
-      if (kIsWeb) {
-        await storageRef.putData(bytes);
-      } else {
-        await storageRef.putFile(File(picked.path));
-      }
       final imageUrl = await storageRef.getDownloadURL();
 
+      setState(() {
+        _busyTitle = 'Posting loo…';
+        _busySubtitle = 'Saving location to database.';
+      });
       await _toiletCollection.add({
         'imageUrl': imageUrl,
-        'location': GeoPoint(finalLatLng.latitude, finalLatLng.longitude),
-        'timestamp': Timestamp.fromDate(metadata.timestamp ?? DateTime.now()),
+        'storagePath': storagePath,
+        'location': GeoPoint(
+          confirmed.latLng!.latitude,
+          confirmed.latLng!.longitude,
+        ),
+        'timestamp': Timestamp.fromDate(confirmed.timestamp),
         'createdBy': user.uid,
       });
       _showMessage('Loo posted successfully.');
       await _refreshCurrentLocation();
-    } catch (_) {
+    } on FirebaseException catch (e) {
+      debugPrint('FirebaseException during post loo: ${e.code} ${e.message}');
+      _showMessage(
+        'Upload failed: ${e.code}${e.message == null ? '' : ' — ${e.message}'}',
+      );
+    } catch (e) {
+      debugPrint('Unknown error during post loo: $e');
       _showMessage('Failed to post loo. Please try again.');
     } finally {
       if (mounted) {
-        setState(() => _uploading = false);
+        setState(() {
+          _uploading = false;
+          _busyTitle = null;
+          _busySubtitle = null;
+        });
       }
     }
+  }
+
+  Uint8List _compressForUpload(Uint8List originalBytes) {
+    // EXIF is already read from originalBytes; we can now resize/compress
+    // aggressively for upload size.
+    try {
+      final decoded = img.decodeImage(originalBytes);
+      if (decoded == null) {
+        return originalBytes;
+      }
+
+      // Resize to a sane max dimension for mobile uploads.
+      const maxDim = 1280;
+      final needsResize = decoded.width > maxDim || decoded.height > maxDim;
+      final resized = needsResize
+          ? img.copyResize(
+              decoded,
+              width: decoded.width >= decoded.height ? maxDim : null,
+              height: decoded.height > decoded.width ? maxDim : null,
+              interpolation: img.Interpolation.average,
+            )
+          : decoded;
+
+      // Encode as JPEG with fairly low quality for bandwidth.
+      const quality = 35;
+      final jpg = img.encodeJpg(resized, quality: quality);
+      // Only keep compressed if it actually reduces size.
+      if (jpg.lengthInBytes > 0 && jpg.lengthInBytes < originalBytes.length) {
+        return Uint8List.fromList(jpg);
+      }
+      return originalBytes;
+    } catch (e) {
+      debugPrint('Image compression failed, uploading original: $e');
+      return originalBytes;
+    }
+  }
+
+  Future<_PostLooConfirmation?> _confirmPostLoo({
+    required Uint8List imageBytes,
+    required LatLng? exifLatLng,
+    required LatLng? deviceLatLng,
+    required DateTime? exifTimestamp,
+  }) async {
+    final hasExifGps = exifLatLng != null;
+    final hasDeviceGps = deviceLatLng != null;
+
+    final defaultSource = hasExifGps
+        ? _LocationChoice.exif
+        : _LocationChoice.device;
+    _LocationChoice selected = defaultSource;
+
+    final resolvedTimestamp = exifTimestamp ?? DateTime.now();
+
+    return showModalBottomSheet<_PostLooConfirmation>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: const Color(0xFF1B1B1B),
+      builder: (context) {
+        return SafeArea(
+          child: StatefulBuilder(
+            builder: (context, setModalState) {
+              LatLng? chosenLatLng;
+              if (selected == _LocationChoice.exif) {
+                chosenLatLng = exifLatLng;
+              } else {
+                chosenLatLng = deviceLatLng;
+              }
+
+              return Padding(
+                padding: EdgeInsets.only(
+                  left: 16,
+                  right: 16,
+                  top: 16,
+                  bottom: 16 + MediaQuery.of(context).viewInsets.bottom,
+                ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    const Text(
+                      'Confirm Loo Location',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 18,
+                        fontWeight: FontWeight.w800,
+                      ),
+                      textAlign: TextAlign.center,
+                    ),
+                    const SizedBox(height: 12),
+                    ClipRRect(
+                      borderRadius: BorderRadius.circular(14),
+                      child: AspectRatio(
+                        aspectRatio: 16 / 9,
+                        child: Image.memory(imageBytes, fit: BoxFit.cover),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    _KeyValueRow(
+                      label: 'Photo GPS (EXIF)',
+                      value: hasExifGps ? 'Found' : 'Not found',
+                      valueColor: hasExifGps
+                          ? Colors.greenAccent
+                          : Colors.orangeAccent,
+                    ),
+                    _KeyValueRow(
+                      label: 'Device GPS (now)',
+                      value: hasDeviceGps ? 'Available' : 'Unavailable',
+                      valueColor: hasDeviceGps
+                          ? Colors.greenAccent
+                          : Colors.redAccent,
+                    ),
+                    const SizedBox(height: 10),
+                    if (hasExifGps || hasDeviceGps)
+                      SegmentedButton<_LocationChoice>(
+                        segments: const [
+                          ButtonSegment(
+                            value: _LocationChoice.exif,
+                            label: Text('Use Photo Location'),
+                            icon: Icon(Icons.photo),
+                          ),
+                          ButtonSegment(
+                            value: _LocationChoice.device,
+                            label: Text('Use Current Location'),
+                            icon: Icon(Icons.my_location),
+                          ),
+                        ],
+                        selected: <_LocationChoice>{selected},
+                        onSelectionChanged: (s) {
+                          final next = s.first;
+                          if (next == _LocationChoice.exif && !hasExifGps) {
+                            return;
+                          }
+                          if (next == _LocationChoice.device && !hasDeviceGps) {
+                            return;
+                          }
+                          setModalState(() => selected = next);
+                        },
+                      ),
+                    if (!hasExifGps && hasDeviceGps)
+                      const Padding(
+                        padding: EdgeInsets.only(top: 10),
+                        child: Text(
+                          'This photo did not include GPS data. We will use your current device location unless you cancel.',
+                          style: TextStyle(color: Colors.white70),
+                        ),
+                      ),
+                    if (!hasExifGps && !hasDeviceGps)
+                      const Padding(
+                        padding: EdgeInsets.only(top: 10),
+                        child: Text(
+                          'No GPS could be determined (photo had no GPS and device GPS is unavailable).',
+                          style: TextStyle(color: Colors.white70),
+                        ),
+                      ),
+                    const SizedBox(height: 12),
+                    if (chosenLatLng != null)
+                      _KeyValueRow(
+                        label: 'Will save',
+                        value:
+                            '${chosenLatLng.latitude.toStringAsFixed(6)}, ${chosenLatLng.longitude.toStringAsFixed(6)}',
+                        valueColor: Colors.white,
+                      ),
+                    _KeyValueRow(
+                      label: 'Timestamp',
+                      value: resolvedTimestamp.toLocal().toString(),
+                      valueColor: Colors.white,
+                    ),
+                    const SizedBox(height: 14),
+                    SizedBox(
+                      height: 56,
+                      child: FilledButton.icon(
+                        onPressed: chosenLatLng == null
+                            ? null
+                            : () {
+                                Navigator.pop(
+                                  context,
+                                  _PostLooConfirmation(
+                                    latLng: chosenLatLng,
+                                    timestamp: resolvedTimestamp,
+                                  ),
+                                );
+                              },
+                        icon: const Icon(Icons.cloud_upload),
+                        label: const Text('Post Loo'),
+                      ),
+                    ),
+                    TextButton(
+                      onPressed: () => Navigator.pop(context, null),
+                      child: const Text('Cancel'),
+                    ),
+                  ],
+                ),
+              );
+            },
+          ),
+        );
+      },
+    );
   }
 
   Future<_ExtractedMetadata> _extractMetadata(Uint8List bytes) async {
@@ -417,8 +656,27 @@ class _MainShellState extends State<MainShell> {
           final lonRef = lonRefTag?.printable.toUpperCase() ?? 'E';
           final normalizedLat = latRef.contains('S') ? -lat : lat;
           final normalizedLon = lonRef.contains('W') ? -lon : lon;
-          latLng = LatLng(normalizedLat, normalizedLon);
+          final finiteLat = _finiteOrNull(normalizedLat);
+          final finiteLon = _finiteOrNull(normalizedLon);
+          if (finiteLat != null &&
+              finiteLon != null &&
+              finiteLat.abs() <= 90 &&
+              finiteLon.abs() <= 180) {
+            latLng = LatLng(finiteLat, finiteLon);
+          } else {
+            debugPrint(
+              'EXIF GPS decoded to invalid coordinates: '
+              'lat=$normalizedLat lon=$normalizedLon '
+              '(ref: $latRef/$lonRef, raw: ${latTag.values.toList()} / ${lonTag.values.toList()})',
+            );
+          }
         }
+      }
+      if (latLng == null) {
+        final gpsKeys = tags.keys
+            .where((k) => k.toLowerCase().contains('gps'))
+            .toList();
+        debugPrint('EXIF GPS not found. Available GPS keys: $gpsKeys');
       }
 
       DateTime? timestamp =
@@ -431,24 +689,35 @@ class _MainShellState extends State<MainShell> {
   }
 
   double? _dmsToDecimal(List<dynamic> values) {
+    // Most common format is [deg, min, sec]. Some encoders provide a single
+    // decimal degree value; support that too.
+    if (values.isEmpty) {
+      return null;
+    }
+    if (values.length == 1) {
+      final v = _toDouble(values[0]);
+      return _finiteOrNull(v);
+    }
     if (values.length < 3) {
       return null;
     }
-    final d = _toDouble(values[0]);
-    final m = _toDouble(values[1]);
-    final s = _toDouble(values[2]);
+    final d = _finiteOrNull(_toDouble(values[0]));
+    final m = _finiteOrNull(_toDouble(values[1]));
+    final s = _finiteOrNull(_toDouble(values[2]));
     if (d == null || m == null || s == null) {
       return null;
     }
-    return d + (m / 60) + (s / 3600);
+    return _finiteOrNull(d + (m / 60) + (s / 3600));
   }
 
   double? _toDouble(dynamic value) {
     if (value is num) {
-      return value.toDouble();
+      return _finiteOrNull(value.toDouble());
     }
     if (value is Ratio) {
-      return value.toDouble();
+      // Guard against corrupt EXIF like 0 denominators.
+      final d = value.toDouble();
+      return _finiteOrNull(d);
     }
     final text = value.toString().trim();
     if (text.contains('/')) {
@@ -457,11 +726,21 @@ class _MainShellState extends State<MainShell> {
         final n = double.tryParse(parts[0]);
         final d = double.tryParse(parts[1]);
         if (n != null && d != null && d != 0) {
-          return n / d;
+          return _finiteOrNull(n / d);
         }
       }
     }
-    return double.tryParse(text);
+    return _finiteOrNull(double.tryParse(text));
+  }
+
+  double? _finiteOrNull(double? value) {
+    if (value == null) {
+      return null;
+    }
+    if (value.isNaN || value.isInfinite) {
+      return null;
+    }
+    return value;
   }
 
   DateTime? _parseExifDate(String? printable) {
@@ -566,9 +845,23 @@ class _MainShellState extends State<MainShell> {
             ],
           ),
           body: SafeArea(
-            child: _selectedIndex == 1
-                ? _buildMapWithNearestPanel(map: pages[1], nearest: nearest)
-                : pages[_selectedIndex],
+            child: Stack(
+              children: [
+                Positioned.fill(
+                  child: _selectedIndex == 1
+                      ? _buildMapWithNearestPanel(
+                          map: pages[1],
+                          nearest: nearest,
+                        )
+                      : pages[_selectedIndex],
+                ),
+                if (_uploading)
+                  _UploadingOverlay(
+                    title: _busyTitle ?? 'Working…',
+                    subtitle: _busySubtitle ?? 'Please wait.',
+                  ),
+              ],
+            ),
           ),
           bottomNavigationBar: _BottomNav(
             selectedIndex: _selectedIndex,
@@ -655,6 +948,8 @@ class _MainShellState extends State<MainShell> {
       context: context,
       backgroundColor: const Color(0xFF1B1B1B),
       builder: (context) {
+        final currentUid = FirebaseAuth.instance.currentUser?.uid;
+        final canDelete = currentUid != null && currentUid == toilet.createdBy;
         return SafeArea(
           child: Padding(
             padding: const EdgeInsets.all(16),
@@ -666,16 +961,7 @@ class _MainShellState extends State<MainShell> {
                   borderRadius: BorderRadius.circular(14),
                   child: AspectRatio(
                     aspectRatio: 16 / 9,
-                    child: Image.network(
-                      toilet.imageUrl,
-                      fit: BoxFit.cover,
-                      errorBuilder: (_, _, _) => const ColoredBox(
-                        color: Colors.black26,
-                        child: Center(
-                          child: Icon(Icons.broken_image, color: Colors.white),
-                        ),
-                      ),
-                    ),
+                    child: _ToiletImagePreview(toilet: toilet),
                   ),
                 ),
                 const SizedBox(height: 12),
@@ -687,6 +973,55 @@ class _MainShellState extends State<MainShell> {
                   ),
                 ),
                 const SizedBox(height: 8),
+                if (canDelete) ...[
+                  SizedBox(
+                    height: 52,
+                    child: ElevatedButton.icon(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.redAccent,
+                        foregroundColor: Colors.white,
+                      ),
+                      onPressed: () async {
+                        final confirmed = await showDialog<bool>(
+                          context: context,
+                          builder: (context) {
+                            return AlertDialog(
+                              title: const Text('Delete loo?'),
+                              content: const Text(
+                                'This will permanently delete the loo and its photo.',
+                              ),
+                              actions: [
+                                TextButton(
+                                  onPressed: () =>
+                                      Navigator.pop(context, false),
+                                  child: const Text('Cancel'),
+                                ),
+                                FilledButton(
+                                  onPressed: () => Navigator.pop(context, true),
+                                  child: const Text('Delete'),
+                                ),
+                              ],
+                            );
+                          },
+                        );
+                        if (confirmed != true) {
+                          return;
+                        }
+                        if (!context.mounted) {
+                          return;
+                        }
+                        Navigator.pop(context);
+                        await _deleteToilet(toilet);
+                      },
+                      icon: const Icon(Icons.delete),
+                      label: const Text(
+                        'Delete loo',
+                        style: TextStyle(fontWeight: FontWeight.w800),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                ],
                 FilledButton.icon(
                   onPressed: () => _openExternalMap(toilet.latLng),
                   icon: const Icon(Icons.map),
@@ -698,6 +1033,57 @@ class _MainShellState extends State<MainShell> {
         );
       },
     );
+  }
+
+  Future<void> _deleteToilet(ToiletPoint toilet) async {
+    final currentUid = FirebaseAuth.instance.currentUser?.uid;
+    if (currentUid == null || currentUid != toilet.createdBy) {
+      _showMessage('You can only delete loos you posted.');
+      return;
+    }
+    if (_uploading) {
+      return;
+    }
+    setState(() {
+      _uploading = true;
+      _busyTitle = 'Deleting loo…';
+      _busySubtitle = 'Removing photo and record.';
+    });
+    try {
+      final storagePath = toilet.storagePath;
+      if (storagePath != null && storagePath.isNotEmpty) {
+        await FirebaseStorage.instance.ref().child(storagePath).delete();
+      } else {
+        final url = toilet.imageUrl.trim();
+        if (url.startsWith('gs://')) {
+          await FirebaseStorage.instance.refFromURL(url).delete();
+        } else {
+          // Download-token URLs aren't guaranteed to be supported by refFromURL.
+          try {
+            await FirebaseStorage.instance.refFromURL(url).delete();
+          } catch (_) {}
+        }
+      }
+
+      await _toiletCollection.doc(toilet.docId).delete();
+      _showMessage('Loo deleted.');
+    } on FirebaseException catch (e) {
+      debugPrint('Delete loo FirebaseException: ${e.code} ${e.message}');
+      _showMessage(
+        'Delete failed: ${e.code}${e.message == null ? '' : ' — ${e.message}'}',
+      );
+    } catch (e) {
+      debugPrint('Delete loo unknown error: $e');
+      _showMessage('Delete failed. Please try again.');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _uploading = false;
+          _busyTitle = null;
+          _busySubtitle = null;
+        });
+      }
+    }
   }
 }
 
@@ -770,6 +1156,8 @@ class MapPage extends StatelessWidget {
     this.initialCenter,
   });
 
+  static const LatLng _utrecht = LatLng(52.0907, 5.1214);
+
   final MapController mapController;
   final List<ToiletPoint> toilets;
   final void Function(ToiletPoint toilet) onMarkerTap;
@@ -780,8 +1168,9 @@ class MapPage extends StatelessWidget {
     return FlutterMap(
       mapController: mapController,
       options: MapOptions(
-        initialCenter: initialCenter ?? const LatLng(51.5074, -0.1278),
-        initialZoom: initialCenter == null ? 12 : 16,
+        // Default to Utrecht while we fetch user GPS and recenter.
+        initialCenter: initialCenter ?? _utrecht,
+        initialZoom: initialCenter == null ? 13 : 16,
       ),
       children: [
         TileLayer(
@@ -806,12 +1195,29 @@ class MapPage extends StatelessWidget {
               .map(
                 (toilet) => Marker(
                   point: toilet.latLng,
-                  width: 44,
-                  height: 44,
+                  width: 46,
+                  height: 46,
                   child: GestureDetector(
                     onTap: () => onMarkerTap(toilet),
-                    child: const Center(
-                      child: Text('🚽', style: TextStyle(fontSize: 30)),
+                    child: Center(
+                      child: DecoratedBox(
+                        decoration: BoxDecoration(
+                          color: Colors.black,
+                          borderRadius: BorderRadius.circular(999),
+                          border: Border.all(color: Colors.amber, width: 2),
+                          boxShadow: const [
+                            BoxShadow(
+                              color: Colors.black54,
+                              blurRadius: 8,
+                              offset: Offset(0, 3),
+                            ),
+                          ],
+                        ),
+                        child: const Padding(
+                          padding: EdgeInsets.all(6),
+                          child: Icon(Icons.wc, color: Colors.amber, size: 26),
+                        ),
+                      ),
                     ),
                   ),
                 ),
@@ -825,13 +1231,19 @@ class MapPage extends StatelessWidget {
 
 class ToiletPoint {
   const ToiletPoint({
+    required this.docId,
     required this.latLng,
     required this.imageUrl,
+    required this.createdBy,
+    this.storagePath,
     required this.timestamp,
   });
 
+  final String docId;
   final LatLng latLng;
   final String imageUrl;
+  final String createdBy;
+  final String? storagePath;
   final DateTime timestamp;
 
   factory ToiletPoint.fromDoc(QueryDocumentSnapshot<Map<String, dynamic>> doc) {
@@ -839,9 +1251,68 @@ class ToiletPoint {
     final geo = data['location'] as GeoPoint?;
     final ts = data['timestamp'] as Timestamp?;
     return ToiletPoint(
+      docId: doc.id,
       latLng: LatLng(geo?.latitude ?? 0, geo?.longitude ?? 0),
       imageUrl: (data['imageUrl'] as String?) ?? '',
+      createdBy: (data['createdBy'] as String?) ?? '',
+      storagePath: data['storagePath'] as String?,
       timestamp: ts?.toDate() ?? DateTime.now(),
+    );
+  }
+}
+
+class _ToiletImagePreview extends StatelessWidget {
+  const _ToiletImagePreview({required this.toilet});
+
+  final ToiletPoint toilet;
+
+  Future<String?> _resolveUrl() async {
+    final url = toilet.imageUrl.trim();
+    if (url.isEmpty) {
+      return null;
+    }
+    if (url.startsWith('gs://')) {
+      return FirebaseStorage.instance.refFromURL(url).getDownloadURL();
+    }
+    return url;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<String?>(
+      future: _resolveUrl(),
+      builder: (context, snapshot) {
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const ColoredBox(
+            color: Colors.black26,
+            child: Center(child: CircularProgressIndicator()),
+          );
+        }
+        final url = snapshot.data;
+        if (url == null || url.isEmpty) {
+          return const ColoredBox(
+            color: Colors.black26,
+            child: Center(child: Icon(Icons.broken_image, color: Colors.white)),
+          );
+        }
+        return Image.network(
+          url,
+          fit: BoxFit.cover,
+          loadingBuilder: (context, child, loadingProgress) {
+            if (loadingProgress == null) {
+              return child;
+            }
+            return const ColoredBox(
+              color: Colors.black26,
+              child: Center(child: CircularProgressIndicator()),
+            );
+          },
+          errorBuilder: (context, error, stackTrace) => const ColoredBox(
+            color: Colors.black26,
+            child: Center(child: Icon(Icons.broken_image, color: Colors.white)),
+          ),
+        );
+      },
     );
   }
 }
@@ -874,6 +1345,7 @@ class _BottomNav extends StatelessWidget {
       data: NavigationBarThemeData(
         height: height,
         backgroundColor: Colors.black,
+        indicatorColor: Colors.transparent,
         labelTextStyle: WidgetStateProperty.resolveWith((states) {
           final isSelected = states.contains(WidgetState.selected);
           return TextStyle(
@@ -899,6 +1371,99 @@ class _BottomNav extends StatelessWidget {
           NavigationDestination(
             icon: Icon(Icons.add_a_photo),
             label: 'Add Loo',
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _UploadingOverlay extends StatelessWidget {
+  const _UploadingOverlay({required this.title, required this.subtitle});
+
+  final String title;
+  final String subtitle;
+
+  @override
+  Widget build(BuildContext context) {
+    return Stack(
+      children: [
+        const ModalBarrier(dismissible: false, color: Color(0xAA000000)),
+        Center(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 420),
+            child: Card(
+              color: Colors.black,
+              child: Padding(
+                padding: const EdgeInsets.all(20),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const CircularProgressIndicator(),
+                    const SizedBox(height: 14),
+                    Text(
+                      title,
+                      style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                        fontWeight: FontWeight.w800,
+                        color: Colors.white,
+                      ),
+                      textAlign: TextAlign.center,
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      subtitle,
+                      style: const TextStyle(color: Colors.white70),
+                      textAlign: TextAlign.center,
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+enum _LocationChoice { exif, device }
+
+class _PostLooConfirmation {
+  const _PostLooConfirmation({required this.latLng, required this.timestamp});
+
+  final LatLng? latLng;
+  final DateTime timestamp;
+}
+
+class _KeyValueRow extends StatelessWidget {
+  const _KeyValueRow({
+    required this.label,
+    required this.value,
+    required this.valueColor,
+  });
+
+  final String label;
+  final String value;
+  final Color valueColor;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 3),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              label,
+              style: const TextStyle(
+                color: Colors.white70,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+          Text(
+            value,
+            style: TextStyle(color: valueColor, fontWeight: FontWeight.w800),
           ),
         ],
       ),
