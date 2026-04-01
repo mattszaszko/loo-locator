@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:cloud_firestore/cloud_firestore.dart';
@@ -228,6 +229,7 @@ class _MainShellState extends State<MainShell> {
   String? _busySubtitle;
   final ImagePicker _picker = ImagePicker();
   final MapController _mapController = MapController();
+  Timer? _locationRefreshTimer;
   final CollectionReference<Map<String, dynamic>> _toiletCollection =
       FirebaseFirestore.instance.collection('toilets');
 
@@ -235,6 +237,21 @@ class _MainShellState extends State<MainShell> {
   void initState() {
     super.initState();
     _refreshCurrentLocation();
+    _locationRefreshTimer = Timer.periodic(const Duration(seconds: 30), (_) {
+      if (!mounted) {
+        return;
+      }
+      if (_selectedIndex != 1) {
+        return;
+      }
+      _refreshCurrentLocation();
+    });
+  }
+
+  @override
+  void dispose() {
+    _locationRefreshTimer?.cancel();
+    super.dispose();
   }
 
   Future<void> _refreshCurrentLocation() async {
@@ -885,9 +902,36 @@ class _MainShellState extends State<MainShell> {
           left: 12,
           right: 12,
           bottom: navHeight + bottomInset + 12,
-          child: Center(child: _buildFindLooButton(nearest)),
+          child: Center(
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Flexible(child: _buildFindLooButton(nearest)),
+                const SizedBox(width: 10),
+                _buildNearestRefreshButton(),
+              ],
+            ),
+          ),
         ),
       ],
+    );
+  }
+
+  Widget _buildNearestRefreshButton() {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: Colors.black,
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: Colors.amber, width: 2),
+        boxShadow: const [
+          BoxShadow(color: Colors.black54, blurRadius: 8, offset: Offset(0, 3)),
+        ],
+      ),
+      child: IconButton(
+        tooltip: 'Refresh location',
+        onPressed: _refreshCurrentLocation,
+        icon: const Icon(Icons.refresh, color: Colors.amber),
+      ),
     );
   }
 
@@ -947,92 +991,122 @@ class _MainShellState extends State<MainShell> {
     showModalBottomSheet<void>(
       context: context,
       backgroundColor: const Color(0xFF1B1B1B),
+      isScrollControlled: true,
       builder: (context) {
         final currentUid = FirebaseAuth.instance.currentUser?.uid;
         final canDelete = currentUid != null && currentUid == toilet.createdBy;
+        final maxHeight = MediaQuery.of(context).size.height * 0.85;
         return SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                ClipRRect(
-                  borderRadius: BorderRadius.circular(14),
-                  child: AspectRatio(
-                    aspectRatio: 16 / 9,
-                    child: _ToiletImagePreview(toilet: toilet),
-                  ),
-                ),
-                const SizedBox(height: 12),
-                Text(
-                  'Date Posted: ${toilet.timestamp.toLocal()}',
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-                const SizedBox(height: 8),
-                if (canDelete) ...[
-                  SizedBox(
-                    height: 52,
-                    child: ElevatedButton.icon(
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.redAccent,
-                        foregroundColor: Colors.white,
-                      ),
-                      onPressed: () async {
-                        final confirmed = await showDialog<bool>(
-                          context: context,
-                          builder: (context) {
-                            return AlertDialog(
-                              title: const Text('Delete loo?'),
-                              content: const Text(
-                                'This will permanently delete the loo and its photo.',
-                              ),
-                              actions: [
-                                TextButton(
-                                  onPressed: () =>
-                                      Navigator.pop(context, false),
-                                  child: const Text('Cancel'),
-                                ),
-                                FilledButton(
-                                  onPressed: () => Navigator.pop(context, true),
-                                  child: const Text('Delete'),
-                                ),
-                              ],
-                            );
-                          },
-                        );
-                        if (confirmed != true) {
-                          return;
-                        }
-                        if (!context.mounted) {
-                          return;
-                        }
-                        Navigator.pop(context);
-                        await _deleteToilet(toilet);
-                      },
-                      icon: const Icon(Icons.delete),
-                      label: const Text(
-                        'Delete loo',
-                        style: TextStyle(fontWeight: FontWeight.w800),
-                      ),
+          child: ConstrainedBox(
+            constraints: BoxConstraints(maxHeight: maxHeight),
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(14),
+                    child: AspectRatio(
+                      aspectRatio: 16 / 9,
+                      child: _ToiletPhoto(toilet: toilet),
                     ),
                   ),
-                  const SizedBox(height: 10),
+                  const SizedBox(height: 12),
+                  Text(
+                    'Reported: ${_formatReportedAt(toilet.timestamp)}',
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  if (canDelete) ...[
+                    SizedBox(
+                      height: 52,
+                      child: ElevatedButton.icon(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.redAccent,
+                          foregroundColor: Colors.white,
+                        ),
+                        onPressed: () async {
+                          final confirmed = await showDialog<bool>(
+                            context: context,
+                            builder: (context) {
+                              return AlertDialog(
+                                title: const Text('Delete loo?'),
+                                content: const Text(
+                                  'This will permanently delete the loo and its photo.',
+                                ),
+                                actions: [
+                                  TextButton(
+                                    onPressed: () =>
+                                        Navigator.pop(context, false),
+                                    child: const Text('Cancel'),
+                                  ),
+                                  FilledButton(
+                                    onPressed: () =>
+                                        Navigator.pop(context, true),
+                                    child: const Text('Delete'),
+                                  ),
+                                ],
+                              );
+                            },
+                          );
+                          if (confirmed != true) {
+                            return;
+                          }
+                          if (!context.mounted) {
+                            return;
+                          }
+                          Navigator.pop(context);
+                          await _deleteToilet(toilet);
+                        },
+                        icon: const Icon(Icons.delete),
+                        label: const Text(
+                          'Delete loo',
+                          style: TextStyle(fontWeight: FontWeight.w800),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                  ],
+                  SizedBox(
+                    height: 52,
+                    child: FilledButton.icon(
+                      onPressed: () => _openExternalMap(toilet.latLng),
+                      icon: const Icon(Icons.map),
+                      label: const Text('Open in Maps'),
+                    ),
+                  ),
                 ],
-                FilledButton.icon(
-                  onPressed: () => _openExternalMap(toilet.latLng),
-                  icon: const Icon(Icons.map),
-                  label: const Text('Open in Maps'),
-                ),
-              ],
+              ),
             ),
           ),
         );
       },
     );
+  }
+
+  String _formatReportedAt(DateTime reportedAt) {
+    final now = DateTime.now();
+    final local = reportedAt.toLocal();
+
+    DateTime dateOnly(DateTime d) => DateTime(d.year, d.month, d.day);
+
+    final deltaDays = dateOnly(now).difference(dateOnly(local)).inDays;
+    if (deltaDays <= 0) {
+      return 'Today';
+    }
+    if (deltaDays == 1) {
+      return 'Yesterday';
+    }
+    if (deltaDays <= 14) {
+      return '$deltaDays days ago';
+    }
+    final european =
+        '${local.day.toString().padLeft(2, '0')}/${local.month.toString().padLeft(2, '0')}/${local.year}';
+    return 'More than 2 weeks ago • $european';
   }
 
   Future<void> _deleteToilet(ToiletPoint toilet) async {
@@ -1261,26 +1335,106 @@ class ToiletPoint {
   }
 }
 
-class _ToiletImagePreview extends StatelessWidget {
-  const _ToiletImagePreview({required this.toilet});
+class _ToiletPhoto extends StatefulWidget {
+  const _ToiletPhoto({required this.toilet});
 
   final ToiletPoint toilet;
 
-  Future<String?> _resolveUrl() async {
+  @override
+  State<_ToiletPhoto> createState() => _ToiletPhotoState();
+}
+
+class _ToiletPhotoState extends State<_ToiletPhoto> {
+  Future<_ResolvedToiletPhoto>? _future;
+
+  @override
+  void initState() {
+    super.initState();
+    _future = _resolve(widget.toilet);
+  }
+
+  @override
+  void didUpdateWidget(covariant _ToiletPhoto oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.toilet.docId != widget.toilet.docId ||
+        oldWidget.toilet.imageUrl != widget.toilet.imageUrl ||
+        oldWidget.toilet.storagePath != widget.toilet.storagePath) {
+      _future = _resolve(widget.toilet);
+    }
+  }
+
+  Future<_ResolvedToiletPhoto> _resolve(ToiletPoint toilet) async {
+    final ref = _storageRefFromToilet(toilet);
+    if (ref != null) {
+      // On web, `getData()` goes through fetch/XHR and can fail due to
+      // browser/CORS/interop issues. Loading an <img> via Image.network is
+      // usually more reliable.
+      if (kIsWeb) {
+        final url = await ref.getDownloadURL();
+        return _ResolvedToiletPhoto(url: url);
+      } else {
+        // Prefer authenticated Firebase SDK fetch to avoid URL/CORS/token issues.
+        final bytes = await ref.getData(8 * 1024 * 1024); // 8MB cap
+        if (bytes != null && bytes.isNotEmpty) {
+          return _ResolvedToiletPhoto(bytes: bytes);
+        }
+      }
+    }
+
+    final url = _downloadUrlFromToilet(toilet);
+    if (url != null) {
+      return _ResolvedToiletPhoto(url: url);
+    }
+
+    throw StateError('No photo reference available.');
+  }
+
+  Reference? _storageRefFromToilet(ToiletPoint toilet) {
+    final storagePath = (toilet.storagePath ?? '').trim();
+    if (storagePath.isNotEmpty) {
+      return FirebaseStorage.instance.ref().child(storagePath);
+    }
+
     final url = toilet.imageUrl.trim();
     if (url.isEmpty) {
       return null;
     }
     if (url.startsWith('gs://')) {
-      return FirebaseStorage.instance.refFromURL(url).getDownloadURL();
+      return FirebaseStorage.instance.refFromURL(url);
+    }
+
+    // Parse Firebase Storage download URLs:
+    // https://firebasestorage.googleapis.com/v0/b/<bucket>/o/<encodedPath>?...
+    try {
+      final uri = Uri.parse(url);
+      final segments = uri.pathSegments;
+      final oIndex = segments.indexOf('o');
+      if (oIndex != -1 && oIndex + 1 < segments.length) {
+        final encodedPath = segments[oIndex + 1];
+        final decodedPath = Uri.decodeComponent(encodedPath);
+        if (decodedPath.isNotEmpty) {
+          return FirebaseStorage.instance.ref().child(decodedPath);
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  String? _downloadUrlFromToilet(ToiletPoint toilet) {
+    final url = toilet.imageUrl.trim();
+    if (url.isEmpty) {
+      return null;
+    }
+    if (url.startsWith('gs://')) {
+      return null; // prefer resolving via ref
     }
     return url;
   }
 
   @override
   Widget build(BuildContext context) {
-    return FutureBuilder<String?>(
-      future: _resolveUrl(),
+    return FutureBuilder<_ResolvedToiletPhoto>(
+      future: _future,
       builder: (context, snapshot) {
         if (snapshot.connectionState == ConnectionState.waiting) {
           return const ColoredBox(
@@ -1288,16 +1442,33 @@ class _ToiletImagePreview extends StatelessWidget {
             child: Center(child: CircularProgressIndicator()),
           );
         }
-        final url = snapshot.data;
-        if (url == null || url.isEmpty) {
+        if (snapshot.hasError) {
+          debugPrint(
+            'Toilet photo load failed for doc=${widget.toilet.docId} '
+            'path=${widget.toilet.storagePath} url=${widget.toilet.imageUrl}: '
+            '${snapshot.error}',
+          );
           return const ColoredBox(
             color: Colors.black26,
             child: Center(child: Icon(Icons.broken_image, color: Colors.white)),
           );
         }
+        final resolved = snapshot.data!;
+        if (resolved.bytes != null) {
+          return Image.memory(
+            resolved.bytes!,
+            fit: BoxFit.cover,
+            gaplessPlayback: true,
+          );
+        }
         return Image.network(
-          url,
+          resolved.url!,
           fit: BoxFit.cover,
+          // On Flutter web, the default fetch-based loader can fail with
+          // statusCode 0 when the browser blocks the request (CORS/fetch).
+          // For Firebase Storage download URLs, using an <img> element is the
+          // most reliable approach.
+          webHtmlElementStrategy: WebHtmlElementStrategy.prefer,
           loadingBuilder: (context, child, loadingProgress) {
             if (loadingProgress == null) {
               return child;
@@ -1307,14 +1478,29 @@ class _ToiletImagePreview extends StatelessWidget {
               child: Center(child: CircularProgressIndicator()),
             );
           },
-          errorBuilder: (context, error, stackTrace) => const ColoredBox(
-            color: Colors.black26,
-            child: Center(child: Icon(Icons.broken_image, color: Colors.white)),
-          ),
+          errorBuilder: (context, error, stackTrace) {
+            debugPrint(
+              'Toilet photo network load failed for doc=${widget.toilet.docId} '
+              'url=${resolved.url}: $error',
+            );
+            return const ColoredBox(
+              color: Colors.black26,
+              child: Center(
+                child: Icon(Icons.broken_image, color: Colors.white),
+              ),
+            );
+          },
         );
       },
     );
   }
+}
+
+class _ResolvedToiletPhoto {
+  const _ResolvedToiletPhoto({this.bytes, this.url});
+
+  final Uint8List? bytes;
+  final String? url;
 }
 
 class _ExtractedMetadata {
