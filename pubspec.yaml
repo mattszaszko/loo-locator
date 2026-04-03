@@ -47,6 +47,8 @@ dependencies:
   flutter_map_location_marker: ^10.2.0
   riverpod: ^3.2.1
   image: ^4.8.0
+  http: ^1.6.0
+  flutter_map_marker_cluster: ^8.2.2
 
 dev_dependencies:
   flutter_test:
