@@ -13,6 +13,7 @@ import 'package:flutter_map/flutter_map.dart';
 import 'package:flutter_map_location_marker/flutter_map_location_marker.dart';
 import 'package:flutter_map_marker_cluster/flutter_map_marker_cluster.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:google_sign_in/google_sign_in.dart';
 import 'package:http/http.dart' as http;
 import 'package:image/image.dart' as img;
 import 'package:image_picker/image_picker.dart';
@@ -20,10 +21,17 @@ import 'package:latlong2/latlong.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import 'firebase_options.dart';
+import 'loo_svg_icon.dart';
+import 'onboarding_screen.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+  try {
+    await GoogleSignIn.instance.initialize();
+  } catch (e, st) {
+    debugPrint('GoogleSignIn.initialize failed: $e\n$st');
+  }
   runApp(const LooLocatorApp());
 }
 
@@ -75,144 +83,8 @@ class AuthWrapper extends StatelessWidget {
         if (snapshot.hasData) {
           return const MainShell();
         }
-        return const AuthPage();
+        return const OnboardingScreen();
       },
-    );
-  }
-}
-
-class AuthPage extends StatefulWidget {
-  const AuthPage({super.key});
-
-  @override
-  State<AuthPage> createState() => _AuthPageState();
-}
-
-class _AuthPageState extends State<AuthPage> {
-  final TextEditingController _emailController = TextEditingController();
-  final TextEditingController _passwordController = TextEditingController();
-  bool _isSignUp = false;
-  bool _isLoading = false;
-  String? _errorText;
-
-  @override
-  void dispose() {
-    _emailController.dispose();
-    _passwordController.dispose();
-    super.dispose();
-  }
-
-  Future<void> _submit() async {
-    setState(() {
-      _isLoading = true;
-      _errorText = null;
-    });
-    try {
-      if (_isSignUp) {
-        await FirebaseAuth.instance.createUserWithEmailAndPassword(
-          email: _emailController.text.trim(),
-          password: _passwordController.text,
-        );
-      } else {
-        await FirebaseAuth.instance.signInWithEmailAndPassword(
-          email: _emailController.text.trim(),
-          password: _passwordController.text,
-        );
-      }
-    } on FirebaseAuthException catch (e) {
-      setState(() => _errorText = e.message ?? 'Authentication failed');
-    } finally {
-      if (mounted) {
-        setState(() => _isLoading = false);
-      }
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      body: Center(
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 420),
-          child: Padding(
-            padding: const EdgeInsets.all(20),
-            child: Card(
-              color: Colors.black,
-              child: Padding(
-                padding: const EdgeInsets.all(20),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    Text(
-                      _isSignUp ? 'Create Account' : 'Welcome Back',
-                      style: Theme.of(context).textTheme.headlineSmall
-                          ?.copyWith(
-                            color: Colors.white,
-                            fontWeight: FontWeight.w700,
-                          ),
-                      textAlign: TextAlign.center,
-                    ),
-                    const SizedBox(height: 16),
-                    TextField(
-                      controller: _emailController,
-                      keyboardType: TextInputType.emailAddress,
-                      style: const TextStyle(color: Colors.white),
-                      decoration: _inputDecoration('Email'),
-                    ),
-                    const SizedBox(height: 12),
-                    TextField(
-                      controller: _passwordController,
-                      obscureText: true,
-                      style: const TextStyle(color: Colors.white),
-                      decoration: _inputDecoration('Password'),
-                    ),
-                    const SizedBox(height: 12),
-                    if (_errorText != null)
-                      Text(
-                        _errorText!,
-                        style: const TextStyle(color: Colors.redAccent),
-                      ),
-                    const SizedBox(height: 12),
-                    SizedBox(
-                      height: 54,
-                      child: FilledButton(
-                        onPressed: _isLoading ? null : _submit,
-                        child: _isLoading
-                            ? const CircularProgressIndicator()
-                            : Text(_isSignUp ? 'Sign Up' : 'Log In'),
-                      ),
-                    ),
-                    TextButton(
-                      onPressed: _isLoading
-                          ? null
-                          : () => setState(() => _isSignUp = !_isSignUp),
-                      child: Text(
-                        _isSignUp
-                            ? 'Already have an account? Log in'
-                            : 'Need an account? Sign up',
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  InputDecoration _inputDecoration(String label) {
-    return InputDecoration(
-      labelText: label,
-      labelStyle: const TextStyle(color: Colors.white70),
-      enabledBorder: const OutlineInputBorder(
-        borderSide: BorderSide(color: Colors.white54),
-      ),
-      focusedBorder: const OutlineInputBorder(
-        borderSide: BorderSide(color: Colors.amber),
-      ),
     );
   }
 }
@@ -236,11 +108,16 @@ class _MainShellState extends State<MainShell> {
   Timer? _locationRefreshTimer;
   final CollectionReference<Map<String, dynamic>> _toiletCollection =
       FirebaseFirestore.instance.collection('toilets');
+  bool _mapLocationSnackShown = false;
 
   @override
   void initState() {
     super.initState();
-    _refreshCurrentLocation();
+    _refreshCurrentLocation().then((_) {
+      if (mounted) {
+        _maybePromptLocationOnMap();
+      }
+    });
     _locationRefreshTimer = Timer.periodic(const Duration(seconds: 30), (_) {
       if (!mounted) {
         return;
@@ -286,6 +163,43 @@ class _MainShellState extends State<MainShell> {
     return Geolocator.getCurrentPosition();
   }
 
+  Future<void> _maybePromptLocationOnMap() async {
+    if (_mapLocationSnackShown || _selectedIndex != 1) {
+      return;
+    }
+    final permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.whileInUse ||
+        permission == LocationPermission.always) {
+      return;
+    }
+    _mapLocationSnackShown = true;
+    if (!mounted) {
+      return;
+    }
+    final messenger = ScaffoldMessenger.of(context);
+    final isBlockedForever = permission == LocationPermission.deniedForever;
+    messenger.showSnackBar(
+      SnackBar(
+        content: const Text(
+          'Turn on location to see the nearest loo and your position on the map.',
+        ),
+        action: SnackBarAction(
+          label: isBlockedForever ? 'Settings' : 'Allow',
+          onPressed: () async {
+            if (isBlockedForever) {
+              await Geolocator.openAppSettings();
+            } else {
+              await Geolocator.requestPermission();
+            }
+            if (mounted) {
+              await _refreshCurrentLocation();
+            }
+          },
+        ),
+      ),
+    );
+  }
+
   void _centerMapOnUser() {
     final pos = _currentPosition;
     if (pos == null) {
@@ -304,8 +218,10 @@ class _MainShellState extends State<MainShell> {
     }
     setState(() => _selectedIndex = index);
     if (index == 1) {
-      // Ensure the map snaps to the user's location when returning to the map.
-      WidgetsBinding.instance.addPostFrameCallback((_) => _centerMapOnUser());
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _centerMapOnUser();
+        _maybePromptLocationOnMap();
+      });
     }
   }
 
@@ -916,7 +832,7 @@ class _MainShellState extends State<MainShell> {
                 children: [
                   Row(
                     children: [
-                      const Icon(Icons.wc, size: 16, color: Colors.amber),
+                      const LooSvgIcon(size: 20, color: Colors.amber),
                       const SizedBox(width: 6),
                       const Text(
                         'Nearest loo',
@@ -1330,8 +1246,8 @@ class _PostLooConfirmSheetState extends State<_PostLooConfirmSheet> {
                 child: OutlinedButton(
                   onPressed: _uploading ? null : widget.onCancel,
                   style: OutlinedButton.styleFrom(
-                    foregroundColor: Colors.white,
-                    side: const BorderSide(color: Colors.white54),
+                    foregroundColor: const Color(0xFFFFC107),
+                    side: const BorderSide(color: Color(0xFFFFC107)),
                     shape: RoundedRectangleBorder(
                       borderRadius: BorderRadius.circular(12),
                     ),
@@ -1339,8 +1255,8 @@ class _PostLooConfirmSheetState extends State<_PostLooConfirmSheet> {
                   child: const Text(
                     'Cancel',
                     style: TextStyle(
-                      fontSize: 16,
-                      fontWeight: FontWeight.w700,
+                      fontSize: 15,
+                      fontWeight: FontWeight.w800,
                     ),
                   ),
                 ),
@@ -1457,7 +1373,7 @@ class MapPage extends StatelessWidget {
                   ],
                 ),
                 child: const Center(
-                  child: Icon(Icons.wc, color: Colors.amber, size: 26),
+                  child: LooSvgIcon(size: 28, color: Colors.amber),
                 ),
               ),
             ),
